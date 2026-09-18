@@ -8,7 +8,7 @@ on:
       nama_siswa:
         description: 'Dias Hafiidh Ega Maulana'
         required: true
-        default: 'Siswa TJKT'
+        default: 'Dias Hafiidh Ega Maulana'
 
 jobs:
   test:
