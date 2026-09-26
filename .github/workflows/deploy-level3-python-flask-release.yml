@@ -1,26 +1,42 @@
 name: "Skenario 1 - Level 3 - Deploy Flask (release + cron)"
 
-# Trigger: tag rilis v* ATAU jadwal cron harian
+# Trigger:
+# - Tag v* = release
+# - Schedule = refresh harian
+# - Manual = Run workflow
 on:
   push:
     tags:
       - 'v*'
+
   schedule:
-    - cron: '0 2 * * *'   # setiap hari jam 02:00 UTC
+    - cron: '0 2 * * *'
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versi release untuk deployment manual'
+        required: true
+        type: string
+        default: 'manual-deploy'
 
 jobs:
   deploy:
     name: Deploy Flask app ke VM-A
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout kode
         uses: actions/checkout@v4
 
       - name: Tentukan versi rilis
         id: ver
+        shell: bash
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
           else
             echo "version=scheduled-refresh" >> "$GITHUB_OUTPUT"
           fi
@@ -29,14 +45,16 @@ jobs:
         run: |
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
           sudo dpkg -i cloudflared.deb
-          sudo apt-get update -y && sudo apt-get install -y sshpass
+          sudo apt-get update -y
+          sudo apt-get install -y sshpass
 
-      - name: Siapkan SSH config (ProxyCommand Cloudflare Access, tanpa SSH key)
+      - name: Siapkan SSH config
         env:
           CF_ACCESS_HOSTNAME: ${{ secrets.CF_ACCESS_HOSTNAME }}
         run: |
           mkdir -p ~/.ssh
-          cat >> ~/.ssh/config <<EOC
+
+          cat > ~/.ssh/config <<EOC
           Host vm-a
             HostName ${CF_ACCESS_HOSTNAME}
             User ${{ secrets.VPS_USERNAME }}
@@ -45,24 +63,89 @@ jobs:
             UserKnownHostsFile=/dev/null
           EOC
 
+          chmod 600 ~/.ssh/config
+
+      - name: Siapkan Python dan folder Flask di VM-A
+        env:
+          SSHPASS: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            vm-a "
+              sudo apt-get update &&
+              sudo apt-get install -y python3 python3-pip python3-venv &&
+              sudo mkdir -p /opt/level3-flask &&
+              sudo chown -R \$USER:\$USER /opt/level3-flask
+            "
+
       - name: Upload kode Flask ke VM-A
         env:
           SSHPASS: ${{ secrets.VPS_PASSWORD }}
         run: |
-          ssh vm-a "sudo mkdir -p /opt/level3-flask && sudo chown \$USER:\$USER /opt/level3-flask"
-          sshpass -e scp -o StrictHostKeyChecking=no \
+          sshpass -e scp \
+            -o StrictHostKeyChecking=no \
             skenario1-github-actions-vps-proxycommand/level3-python-flask-release/app/app.py \
             skenario1-github-actions-vps-proxycommand/level3-python-flask-release/app/requirements.txt \
             vm-a:/opt/level3-flask/
 
-      - name: Install dependency & set versi & restart service
+      - name: Buat virtual environment dan install dependency
+        env:
+          SSHPASS: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            vm-a "
+              cd /opt/level3-flask &&
+              python3 -m venv venv &&
+              venv/bin/pip install --upgrade pip &&
+              venv/bin/pip install -r requirements.txt
+            "
+
+      - name: Buat systemd service Flask
         env:
           SSHPASS: ${{ secrets.VPS_PASSWORD }}
           RELEASE_VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          sshpass -e ssh vm-a "
-            /opt/level3-flask/venv/bin/pip install -r /opt/level3-flask/requirements.txt &&
-            sudo sed -i 's/^Environment=APP_VERSION=.*/Environment=APP_VERSION=${RELEASE_VERSION}/' /etc/systemd/system/level3-flask.service &&
-            sudo systemctl daemon-reload &&
-            sudo systemctl restart level3-flask
-          "
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            vm-a "
+              sudo tee /etc/systemd/system/level3-flask.service > /dev/null <<EOF
+          [Unit]
+          Description=Level 3 Flask Application
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=\$USER
+          WorkingDirectory=/opt/level3-flask
+          Environment=APP_VERSION=${RELEASE_VERSION}
+          ExecStart=/opt/level3-flask/venv/bin/gunicorn --bind 127.0.0.1:5000 app:app
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+            "
+
+      - name: Reload dan restart systemd service
+        env:
+          SSHPASS: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            vm-a "
+              sudo systemctl daemon-reload &&
+              sudo systemctl enable level3-flask &&
+              sudo systemctl restart level3-flask &&
+              sudo systemctl status level3-flask --no-pager
+            "
+
+      - name: Test Flask dari VM-A
+        env:
+          SSHPASS: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          sshpass -e ssh \
+            -o StrictHostKeyChecking=no \
+            vm-a \
+            "curl -f http://127.0.0.1:5000/"
