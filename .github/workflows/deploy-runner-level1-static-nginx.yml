@@ -5,7 +5,7 @@ on:
     branches: [ main ]
     paths:
       - 'skenario2-self-hosted-runner/level1-static-nginx/app/**'
-
+  workflow_dispatch:
 jobs:
   deploy:
     name: Deploy static site langsung di VM-B
